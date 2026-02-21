@@ -1,18 +1,21 @@
 """
 app.py — First Inning Run Probability Tool
-Run with: streamlit run app.py
+Streamlit Community Cloud ready — upload CSVs, get probabilities + odds.
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import os
 
 from model import (
-    train_model, save_model, load_model,
-    get_pitcher_rolling_stats, score_pitchers,
-    prob_to_american, american_to_implied, edge,
-    PITCHER_FEATURE_COLS, get_feature_cols,
+    train_model,
+    get_pitcher_rolling_stats,
+    score_pitchers,
+    prob_to_american,
+    american_to_implied,
+    edge,
+    PITCHER_FEATURE_COLS,
+    get_feature_cols,
 )
 
 # ─────────────────────────────────────────────
@@ -24,144 +27,121 @@ st.set_page_config(
     layout="wide",
 )
 
-# ─────────────────────────────────────────────
-# CUSTOM STYLES
-# ─────────────────────────────────────────────
 st.markdown("""
 <style>
   @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&display=swap');
-  
-  .metric-card {
+  .block-container { padding-top: 2rem; }
+  .prob-high { color: #ff4a6e; }
+  .prob-mid  { color: #ffa54a; }
+  .prob-low  { color: #4affa3; }
+  div[data-testid="metric-container"] {
     background: #111318;
     border: 1px solid #1e2330;
     border-radius: 8px;
-    padding: 16px 20px;
-    margin-bottom: 8px;
+    padding: 12px 16px;
   }
-  .prob-high { color: #ff4a6e; font-size: 2rem; font-weight: 700; }
-  .prob-mid  { color: #ffa54a; font-size: 2rem; font-weight: 700; }
-  .prob-low  { color: #4affa3; font-size: 2rem; font-weight: 700; }
-  .edge-pos  { color: #4affa3; font-weight: 600; }
-  .edge-neg  { color: #ff4a6e; font-weight: 600; }
-  .stDataFrame { font-family: 'IBM Plex Mono', monospace; font-size: 12px; }
-  div[data-testid="metric-container"] { background: #111318; border-radius: 8px; padding: 12px; border: 1px solid #1e2330; }
 </style>
 """, unsafe_allow_html=True)
+
 
 # ─────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────
-REQUIRED_PIT_COLS = {"Date", "Name", "Tm", "R", "K%", "BB%", "K-BB%", "wOBA", "xFIP", "BABIP", "GB%", "LD%", "FB%", "WHIP"}
-REQUIRED_OFF_COLS = {"Date", "Tm", "R"}
+REQUIRED_PIT_COLS = {
+    "Date", "Name", "Tm", "R", "K%", "BB%", "K-BB%",
+    "wOBA", "xFIP", "BABIP", "GB%", "LD%", "FB%", "WHIP"
+}
 
-@st.cache_data(show_spinner=False)
-def cached_train(file_hash: str, pit_df_json: str):
-    pit_df = pd.read_json(pit_df_json)
-    return train_model(pit_df)
-
-def load_csv_or_xlsx(uploaded_file):
-    name = uploaded_file.name.lower()
+def load_upload(f):
+    name = f.name.lower()
     if name.endswith(".csv"):
-        return pd.read_csv(uploaded_file)
-    elif name.endswith((".xlsx", ".xls")):
-        return pd.read_excel(uploaded_file)
-    else:
-        st.error("Please upload a .csv or .xlsx file.")
-        return None
+        return pd.read_csv(f)
+    return pd.read_excel(f)
 
-def validate_df(df, required_cols, label):
-    missing = required_cols - set(df.columns)
+def validate(df, required, label):
+    missing = required - set(df.columns)
     if missing:
-        st.error(f"**{label}** is missing columns: {', '.join(sorted(missing))}")
+        st.error(f"**{label}** missing columns: {', '.join(sorted(missing))}")
         return False
     return True
 
-def prob_color_class(p):
-    if p >= 0.40: return "prob-high"
-    if p >= 0.28: return "prob-mid"
-    return "prob-low"
+def prob_color(p):
+    if p >= 0.40: return "#ff4a6e"
+    if p >= 0.28: return "#ffa54a"
+    return "#4affa3"
 
-def format_edge(e):
-    sign = "+" if e >= 0 else ""
-    cls = "edge-pos" if e >= 0 else "edge-neg"
-    return f'<span class="{cls}">{sign}{e*100:.1f}pp</span>'
+def american_to_implied_safe(s):
+    try:
+        s = s.strip()
+        if not s: return None
+        v = int(s.replace("+", ""))
+        return 100 / (v + 100) if v > 0 else abs(v) / (abs(v) + 100)
+    except Exception:
+        return None
 
-def get_file_hash(f):
-    import hashlib
-    f.seek(0)
-    h = hashlib.md5(f.read()).hexdigest()
-    f.seek(0)
-    return h
 
 # ─────────────────────────────────────────────
-# SESSION STATE INIT
+# SESSION STATE
 # ─────────────────────────────────────────────
-if "model_meta" not in st.session_state:
-    st.session_state.model_meta = None
-if "pit_df" not in st.session_state:
-    st.session_state.pit_df = None
-if "off_df" not in st.session_state:
-    st.session_state.off_df = None
-if "matchups" not in st.session_state:
-    st.session_state.matchups = []
+for key, default in [
+    ("model_meta", None),
+    ("pit_df", None),
+    ("matchups", []),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
+
 
 # ─────────────────────────────────────────────
 # HEADER
 # ─────────────────────────────────────────────
 st.markdown("## ⚾ First Inning Run Probability")
-st.markdown("Upload your FanGraphs first-inning splits CSVs, then build matchups to get model probabilities and implied odds.")
-
+st.caption(
+    "Upload your FanGraphs first-inning pitching splits CSV each day. "
+    "The model trains automatically, then build matchups to see probabilities and implied odds."
+)
 st.divider()
 
+
 # ─────────────────────────────────────────────
-# SIDEBAR — DATA UPLOAD + MODEL TRAINING
+# SIDEBAR
 # ─────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("### 📂 Data Upload")
-    st.caption("Download from FanGraphs › Splits › First Inning. Upload both files each day.")
+    st.markdown("### 📂 Upload Data")
+    st.caption(
+        "FanGraphs → Pitchers → Splits → Innings Pitched → First Inning → Export CSV"
+    )
 
     pit_file = st.file_uploader(
         "Pitching — First Inning Splits",
         type=["csv", "xlsx"],
         key="pit_upload",
-        help="FanGraphs pitching splits filtered to 1st inning"
-    )
-    off_file = st.file_uploader(
-        "Offense — First Inning Splits",
-        type=["csv", "xlsx"],
-        key="off_upload",
-        help="FanGraphs team offense splits filtered to 1st inning"
     )
 
     if pit_file:
-        pit_df = load_csv_or_xlsx(pit_file)
-        if pit_df is not None and validate_df(pit_df, REQUIRED_PIT_COLS, "Pitching file"):
-            for c in PITCHER_FEATURE_COLS + ["R"]:
-                if c in pit_df.columns:
-                    pit_df[c] = pd.to_numeric(pit_df[c], errors="coerce")
-            pit_df["Date"] = pd.to_datetime(pit_df["Date"], errors="coerce")
-            st.session_state.pit_df = pit_df
-            st.success(f"✓ Pitching: {len(pit_df):,} rows, {pit_df['Name'].nunique()} pitchers")
+        try:
+            raw = load_upload(pit_file)
+            if validate(raw, REQUIRED_PIT_COLS, "Pitching file"):
+                for c in PITCHER_FEATURE_COLS + ["R"]:
+                    if c in raw.columns:
+                        raw[c] = pd.to_numeric(raw[c], errors="coerce")
+                raw["Date"] = pd.to_datetime(raw["Date"], errors="coerce")
+                st.session_state.pit_df = raw
 
-    if off_file:
-        off_df = load_csv_or_xlsx(off_file)
-        if off_df is not None and validate_df(off_df, REQUIRED_OFF_COLS, "Offense file"):
-            off_df["Date"] = pd.to_datetime(off_df["Date"], errors="coerce")
-            st.session_state.off_df = off_df
-            st.success(f"✓ Offense: {len(off_df):,} rows, {off_df['Tm'].nunique()} teams")
+                # Auto-train on upload
+                with st.spinner("Training model..."):
+                    meta = train_model(raw)
+                    st.session_state.model_meta = meta
 
-    st.divider()
+                st.success(
+                    f"✓ Ready — {raw['Name'].nunique()} pitchers, "
+                    f"{meta['n_starts']:,} starts\n\n"
+                    f"League avg: **{meta['baseline']*100:.1f}%**"
+                )
+        except Exception as e:
+            st.error(f"Error reading file: {e}")
 
-    if st.session_state.pit_df is not None:
-        if st.button("🔄 Train / Retrain Model", type="primary", use_container_width=True):
-            with st.spinner("Training GBM model on uploaded data..."):
-                meta = train_model(st.session_state.pit_df)
-                st.session_state.model_meta = meta
-            st.success(f"Model trained on {meta['n_starts']:,} starts · {meta['n_pitchers']} pitchers")
-            st.caption(f"League avg 1st-inn run rate: {meta['baseline']*100:.1f}%")
-    else:
-        st.info("Upload pitching splits above to enable training.")
-
+    # Feature importance
     if st.session_state.model_meta:
         st.divider()
         st.markdown("### 📊 Feature Importance")
@@ -174,271 +154,360 @@ with st.sidebar:
         for feat, val in list(imp_clean.items())[:8]:
             pct = val / max_imp
             st.markdown(
-                f"<div style='display:flex;align-items:center;gap:8px;margin-bottom:4px'>"
-                f"<span style='font-size:11px;color:#6b7591;width:70px;text-align:right;flex-shrink:0'>{feat}</span>"
+                f"<div style='display:flex;align-items:center;gap:8px;margin-bottom:5px'>"
+                f"<span style='font-size:11px;color:#6b7591;width:72px;text-align:right;flex-shrink:0'>{feat}</span>"
                 f"<div style='flex:1;background:#1e2330;height:6px;border-radius:3px'>"
                 f"<div style='width:{pct*100:.0f}%;background:#e8ff4a;height:100%;border-radius:3px'></div></div>"
-                f"<span style='font-size:11px;color:#4a5168;width:30px'>{val*100:.1f}%</span>"
+                f"<span style='font-size:11px;color:#4a5168;width:32px'>{val*100:.1f}%</span>"
                 f"</div>",
-                unsafe_allow_html=True
+                unsafe_allow_html=True,
             )
 
+        st.divider()
+        st.markdown("### ℹ️ How to read edge")
+        st.markdown("""
+**Edge** = model probability minus book's implied probability.
+
+- `+5pp` → model sees value, bet the Yes  
+- `0pp` → model agrees with the book  
+- `-5pp` → book is worse than fair value  
+
+Rule of thumb: anything beyond **±3pp** is meaningful.
+        """)
+
+
 # ─────────────────────────────────────────────
-# MAIN — MATCHUP BUILDER
+# GATE: need data
 # ─────────────────────────────────────────────
 if st.session_state.model_meta is None:
-    st.info("👈 Upload your data files and train the model in the sidebar to get started.")
+    st.info("👈 Upload your FanGraphs pitching splits CSV in the sidebar to get started.")
     st.stop()
 
 meta = st.session_state.model_meta
 pit_df = st.session_state.pit_df
+known_pitchers = sorted(
+    get_pitcher_rolling_stats(pit_df)["Name"].dropna().unique().tolist()
+)
 
-# Get known pitchers for autocomplete
-rolling = get_pitcher_rolling_stats(pit_df)
-known_pitchers = sorted(rolling["Name"].dropna().unique().tolist())
-
-st.markdown("### 🎯 Today's Matchups")
-st.caption("Build each game's matchup. Enter the sportsbook's American odds to see your edge.")
 
 # ─────────────────────────────────────────────
-# ADD MATCHUP FORM
+# TABS
 # ─────────────────────────────────────────────
-with st.expander("➕ Add a Matchup", expanded=len(st.session_state.matchups) == 0):
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("**Away Team Pitcher**")
-        away_pitcher = st.selectbox(
-            "Away Pitcher", options=[""] + known_pitchers, key="away_pitcher_sel",
-            label_visibility="collapsed"
-        )
-        away_odds_yes = st.text_input(
-            "Book odds — Yes (run scored)", value="", placeholder="e.g. +120 or -130",
-            key="away_odds_yes",
-            help="Sportsbook American odds for YES a run is scored in the 1st"
-        )
-        away_odds_no = st.text_input(
-            "Book odds — No (run scored)", value="", placeholder="e.g. -150",
-            key="away_odds_no",
-        )
+tab_matchups, tab_rankings, tab_guide = st.tabs(["🎯 Matchups", "📋 All Pitchers", "📖 How to Use"])
 
-    with col2:
-        st.markdown("**Home Team Pitcher**")
-        home_pitcher = st.selectbox(
-            "Home Pitcher", options=[""] + known_pitchers, key="home_pitcher_sel",
-            label_visibility="collapsed"
-        )
-        home_odds_yes = st.text_input(
-            "Book odds — Yes", value="", placeholder="e.g. +140",
-            key="home_odds_yes",
-        )
-        home_odds_no = st.text_input(
-            "Book odds — No", value="", placeholder="e.g. -170",
-            key="home_odds_no",
-        )
 
-    game_label = st.text_input("Game label (optional)", placeholder="e.g. NYY @ BOS 7:10pm")
+# ══════════════════════════════════════════════
+# TAB 1 — MATCHUPS
+# ══════════════════════════════════════════════
+with tab_matchups:
 
-    if st.button("Add Matchup", type="primary"):
-        if not away_pitcher and not home_pitcher:
-            st.warning("Select at least one pitcher.")
-        else:
-            matchup = {
-                "label": game_label or f"{away_pitcher} @ {home_pitcher}",
-                "away": {"name": away_pitcher, "odds_yes": away_odds_yes, "odds_no": away_odds_no},
-                "home": {"name": home_pitcher, "odds_yes": home_odds_yes, "odds_no": home_odds_no},
-            }
-            st.session_state.matchups.append(matchup)
-            st.rerun()
+    # Add matchup form
+    with st.expander("➕ Add a Matchup", expanded=len(st.session_state.matchups) == 0):
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Away Pitcher**")
+            away_p = st.selectbox("Away", [""] + known_pitchers, key="f_away", label_visibility="collapsed")
+            st.markdown("Book odds for this pitcher's 1st inning:")
+            a_yes = st.text_input("Yes (run scores)", placeholder="+120", key="f_a_yes")
+            a_no  = st.text_input("No (run doesn't score)", placeholder="-150", key="f_a_no")
 
-# ─────────────────────────────────────────────
-# DISPLAY MATCHUPS
-# ─────────────────────────────────────────────
-if not st.session_state.matchups:
-    st.markdown("---")
-    st.markdown("No matchups yet. Add one above.")
-    st.stop()
+        with c2:
+            st.markdown("**Home Pitcher**")
+            home_p = st.selectbox("Home", [""] + known_pitchers, key="f_home", label_visibility="collapsed")
+            st.markdown("Book odds for this pitcher's 1st inning:")
+            h_yes = st.text_input("Yes (run scores)", placeholder="+140", key="f_h_yes")
+            h_no  = st.text_input("No (run doesn't score)", placeholder="-170", key="f_h_no")
 
-col_reset, col_spacer = st.columns([1, 5])
-with col_reset:
-    if st.button("🗑 Clear All Matchups"):
+        label = st.text_input("Game label", placeholder="e.g.  NYY @ BOS  7:10 ET", key="f_label")
+
+        if st.button("Add Matchup ➕", type="primary"):
+            if not away_p and not home_p:
+                st.warning("Select at least one pitcher.")
+            else:
+                st.session_state.matchups.append({
+                    "label": label or f"{away_p or '?'} @ {home_p or '?'}",
+                    "away": {"name": away_p, "yes": a_yes, "no": a_no},
+                    "home": {"name": home_p, "yes": h_yes, "no": h_no},
+                })
+                st.rerun()
+
+    if not st.session_state.matchups:
+        st.markdown("No matchups yet — add one above.")
+        st.stop()
+
+    # Clear all
+    if st.button("🗑 Clear all matchups"):
         st.session_state.matchups = []
         st.rerun()
 
-st.divider()
-
-# Score all pitchers in batch
-all_names = []
-for m in st.session_state.matchups:
-    if m["away"]["name"]: all_names.append(m["away"]["name"])
-    if m["home"]["name"]: all_names.append(m["home"]["name"])
-all_names = list(set(all_names))
-
-scores_df = score_pitchers(meta, all_names, pit_df)
-scores = {row["Name"]: row for _, row in scores_df.iterrows()} if not scores_df.empty else {}
-
-def render_pitcher_card(side_label, pitcher_info, scores, meta, col):
-    name = pitcher_info["name"]
-    odds_yes_str = pitcher_info.get("odds_yes", "")
-    odds_no_str = pitcher_info.get("odds_no", "")
-
-    with col:
-        st.markdown(f"**{side_label}**")
-
-        if not name:
-            st.markdown("*No pitcher selected*")
-            return
-
-        if name not in scores or not scores[name].get("found", False):
-            reason = scores.get(name, {}).get("reason", "not found in data")
-            st.warning(f"**{name}** — {reason}")
-            return
-
-        s = scores[name]
-        prob = s["prob"]
-        baseline = meta["baseline"]
-        model_odds_yes = prob_to_american(prob)
-        model_odds_no = prob_to_american(1 - prob)
-
-        # Prob color
-        color = "#ff4a6e" if prob >= 0.40 else ("#ffa54a" if prob >= 0.28 else "#4affa3")
-        vs_baseline = prob - baseline
-        vs_sign = "+" if vs_baseline >= 0 else ""
-        vs_color = "#ff4a6e" if vs_baseline > 0.03 else ("#4affa3" if vs_baseline < -0.03 else "#aaa")
-
-        st.markdown(
-            f"<div style='background:#111318;border:1px solid #1e2330;border-radius:8px;padding:16px'>"
-            f"<div style='font-size:13px;color:#aaa;margin-bottom:4px'>{name} &nbsp;"
-            f"<span style='background:#1e2330;padding:2px 7px;border-radius:3px;font-size:11px;color:#6b7591'>{s.get('Team','')}</span></div>"
-            f"<div style='font-size:36px;font-weight:700;color:{color};line-height:1.1'>{prob*100:.0f}%</div>"
-            f"<div style='font-size:12px;color:#6b7591;margin-bottom:10px'>chance of 1st inning run</div>"
-            f"<div style='font-size:12px;color:{vs_color};margin-bottom:12px'>"
-            f"{vs_sign}{vs_baseline*100:.1f}pp vs league avg ({baseline*100:.1f}%)</div>"
-            f"<div style='display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px'>"
-            f"<div style='background:#0a0c10;border-radius:5px;padding:10px'>"
-            f"<div style='font-size:10px;color:#4a5168;text-transform:uppercase;letter-spacing:1px'>Model Odds (Yes)</div>"
-            f"<div style='font-size:18px;font-weight:600;color:#e8ff4a'>{model_odds_yes}</div></div>"
-            f"<div style='background:#0a0c10;border-radius:5px;padding:10px'>"
-            f"<div style='font-size:10px;color:#4a5168;text-transform:uppercase;letter-spacing:1px'>Model Odds (No)</div>"
-            f"<div style='font-size:18px;font-weight:600;color:#e8ff4a'>{model_odds_no}</div></div>"
-            f"</div>",
-            unsafe_allow_html=True
-        )
-
-        # Edge calculation
-        edge_rows = []
-        for side, odds_str, label in [("yes", odds_yes_str, "Yes"), ("no", odds_no_str, "No")]:
-            model_p = prob if side == "yes" else (1 - prob)
-            book_p = american_to_implied(odds_str) if odds_str.strip() else None
-            if book_p:
-                e = edge(model_p, book_p)
-                sign = "+" if e >= 0 else ""
-                e_color = "#4affa3" if e > 0.02 else ("#ff4a6e" if e < -0.02 else "#aaa")
-                verdict = "✅ Value" if e > 0.02 else ("❌ Fade" if e < -0.02 else "⚪ Neutral")
-                edge_rows.append(
-                    f"<div style='display:flex;justify-content:space-between;align-items:center;"
-                    f"background:#0a0c10;border-radius:5px;padding:8px 12px;margin-bottom:4px'>"
-                    f"<span style='font-size:12px;color:#aaa'>{label} &nbsp;"
-                    f"<span style='color:#6b7591'>Book: {odds_str.strip()}</span></span>"
-                    f"<span style='font-size:12px;color:{e_color}'>{sign}{e*100:.1f}pp &nbsp; {verdict}</span>"
-                    f"</div>"
-                )
-
-        if edge_rows:
-            st.markdown(
-                "<div style='margin-top:4px'>"
-                "<div style='font-size:10px;color:#4a5168;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px'>Edge vs. Book</div>"
-                + "".join(edge_rows) + "</div>",
-                unsafe_allow_html=True
-            )
-
-        # Key stats
-        feat_display = {
-            "K%": ("K%", lambda v: f"{v*100:.1f}%"),
-            "BB%": ("BB%", lambda v: f"{v*100:.1f}%"),
-            "K-BB%": ("K-BB%", lambda v: f"{v*100:.1f}%"),
-            "xFIP": ("xFIP", lambda v: f"{v:.2f}"),
-            "wOBA": ("wOBA", lambda v: f"{v:.3f}"),
-            "BABIP": ("BABIP", lambda v: f"{v:.3f}"),
-        }
-        stat_html = ""
-        for raw_key, (label, fmt) in feat_display.items():
-            roll_key = f"roll_{raw_key}"
-            val = s.get(roll_key, None)
-            if val is not None and not (isinstance(val, float) and np.isnan(val)):
-                stat_html += (
-                    f"<div style='text-align:center;background:#0a0c10;border-radius:5px;padding:8px'>"
-                    f"<div style='font-size:9px;color:#4a5168;text-transform:uppercase;letter-spacing:1px'>{label}</div>"
-                    f"<div style='font-size:14px;color:#cdd4e8'>{fmt(float(val))}</div>"
-                    f"</div>"
-                )
-
-        if stat_html:
-            st.markdown(
-                "<div style='margin-top:10px'>"
-                "<div style='font-size:10px;color:#4a5168;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px'>"
-                "Rolling 10-start averages</div>"
-                f"<div style='display:grid;grid-template-columns:repeat(3,1fr);gap:6px'>{stat_html}</div>"
-                "</div></div>",
-                unsafe_allow_html=True
-            )
-        else:
-            st.markdown("</div>", unsafe_allow_html=True)
-
-
-# Render each matchup
-for i, matchup in enumerate(st.session_state.matchups):
-    st.markdown(f"#### {matchup['label']}")
-    col_away, col_mid, col_home = st.columns([5, 1, 5])
-
-    render_pitcher_card("Away Pitcher", matchup["away"], scores, meta, col_away)
-
-    with col_mid:
-        st.markdown("<div style='text-align:center;padding-top:60px;font-size:24px;color:#4a5168'>vs</div>", unsafe_allow_html=True)
-
-    render_pitcher_card("Home Pitcher", matchup["home"], scores, meta, col_home)
-
-    col_del, _ = st.columns([1, 6])
-    with col_del:
-        if st.button(f"Remove", key=f"del_{i}"):
-            st.session_state.matchups.pop(i)
-            st.rerun()
+    # Batch score all pitchers
+    all_names = list({
+        p["name"]
+        for m in st.session_state.matchups
+        for p in [m["away"], m["home"]]
+        if p["name"]
+    })
+    scores_df = score_pitchers(meta, all_names, pit_df)
+    scores = {r["Name"]: r for _, r in scores_df.iterrows()} if not scores_df.empty else {}
 
     st.divider()
 
-# ─────────────────────────────────────────────
-# PITCHER LOOKUP TABLE
-# ─────────────────────────────────────────────
-st.markdown("### 🔍 All Pitcher Probabilities")
-st.caption("Full ranked list from the model based on your uploaded data.")
+    # ── Render each matchup ──
+    for i, m in enumerate(st.session_state.matchups):
+        st.markdown(f"#### {m['label']}")
+        col_a, col_vs, col_h = st.columns([5, 1, 5])
 
-rolling_full = get_pitcher_rolling_stats(pit_df)
-feat_cols = get_feature_cols()
-valid = rolling_full.dropna(subset=feat_cols)
+        def render_card(col, side_label, pitcher_info):
+            name = pitcher_info["name"]
+            odds_yes = pitcher_info["yes"]
+            odds_no  = pitcher_info["no"]
 
-if not valid.empty:
-    X_all = valid[feat_cols].values.astype(float)
-    probs = meta["model"].predict_proba(X_all)[:, 1]
-    valid = valid.copy()
-    valid["Model Prob"] = probs
-    valid["Implied Odds (Yes)"] = [prob_to_american(p) for p in probs]
-    valid["Implied Odds (No)"] = [prob_to_american(1 - p) for p in probs]
-    valid["vs Baseline"] = probs - meta["baseline"]
-    valid["Actual Rate"] = valid["allowed_run"]
+            with col:
+                st.markdown(f"**{side_label}**")
+                if not name:
+                    st.markdown("*No pitcher selected*")
+                    return
 
-    display_cols = ["Name", "Tm", "Model Prob", "Implied Odds (Yes)", "Implied Odds (No)", "vs Baseline", "Actual Rate"]
-    disp = valid[display_cols].sort_values("Model Prob", ascending=False).reset_index(drop=True)
-    disp.index += 1
+                s = scores.get(name, {})
+                if not s.get("found"):
+                    reason = s.get("reason", "not found in data")
+                    st.warning(f"{name} — {reason}")
+                    return
 
-    # Search filter
-    search = st.text_input("Search pitcher", placeholder="Type a name...", label_visibility="collapsed")
-    if search:
-        disp = disp[disp["Name"].str.lower().str.contains(search.lower())]
+                prob = float(s["prob"])
+                baseline = meta["baseline"]
+                color = prob_color(prob)
+                diff = prob - baseline
+                diff_sign = "+" if diff >= 0 else ""
+                diff_color = "#ff4a6e" if diff > 0.03 else ("#4affa3" if diff < -0.03 else "#aaa")
 
-    # Format for display
-    disp_fmt = disp.copy()
-    disp_fmt["Model Prob"] = disp_fmt["Model Prob"].apply(lambda x: f"{x*100:.1f}%")
-    disp_fmt["vs Baseline"] = disp_fmt["vs Baseline"].apply(lambda x: f"{'+' if x>=0 else ''}{x*100:.1f}pp")
-    disp_fmt["Actual Rate"] = disp_fmt["Actual Rate"].apply(lambda x: f"{x*100:.1f}%" if pd.notna(x) else "—")
-    disp_fmt = disp_fmt.rename(columns={"Tm": "Team"})
+                model_yes = prob_to_american(prob)
+                model_no  = prob_to_american(1 - prob)
 
-    st.dataframe(disp_fmt, use_container_width=True, height=400)
+                # Main card
+                st.markdown(
+                    f"<div style='background:#111318;border:1px solid #1e2330;border-radius:10px;padding:20px'>"
+
+                    # Name + team
+                    f"<div style='font-size:13px;color:#aaa;margin-bottom:6px'>"
+                    f"{name}&nbsp;&nbsp;"
+                    f"<span style='background:#1e2330;padding:2px 8px;border-radius:3px;"
+                    f"font-size:11px;color:#6b7591'>{s.get('Team','')}</span></div>"
+
+                    # Big probability
+                    f"<div style='font-size:48px;font-weight:700;color:{color};line-height:1'>"
+                    f"{prob*100:.0f}%</div>"
+                    f"<div style='font-size:12px;color:#6b7591;margin-bottom:6px'>"
+                    f"chance of allowing a 1st inning run</div>"
+
+                    # vs baseline
+                    f"<div style='font-size:12px;color:{diff_color};margin-bottom:16px'>"
+                    f"{diff_sign}{diff*100:.1f}pp vs league avg ({baseline*100:.1f}%)</div>"
+
+                    # Model odds row
+                    f"<div style='display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px'>"
+                    f"<div style='background:#0a0c10;border-radius:6px;padding:10px'>"
+                    f"<div style='font-size:9px;color:#4a5168;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px'>Model — Yes</div>"
+                    f"<div style='font-size:22px;font-weight:600;color:#e8ff4a'>{model_yes}</div></div>"
+                    f"<div style='background:#0a0c10;border-radius:6px;padding:10px'>"
+                    f"<div style='font-size:9px;color:#4a5168;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px'>Model — No</div>"
+                    f"<div style='font-size:22px;font-weight:600;color:#e8ff4a'>{model_no}</div></div>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+                # Edge rows
+                edge_html = ""
+                for side_key, book_str, label_str, model_p in [
+                    ("yes", odds_yes, "Yes — run scores",       prob),
+                    ("no",  odds_no,  "No — run doesn't score", 1 - prob),
+                ]:
+                    book_imp = american_to_implied_safe(book_str)
+                    if book_imp:
+                        e_val = model_p - book_imp
+                        e_sign = "+" if e_val >= 0 else ""
+                        e_color = "#4affa3" if e_val > 0.02 else ("#ff4a6e" if e_val < -0.02 else "#888")
+                        verdict = "✅ Value" if e_val > 0.02 else ("❌ Avoid" if e_val < -0.02 else "⚪ Neutral")
+                        edge_html += (
+                            f"<div style='display:flex;justify-content:space-between;"
+                            f"background:#0a0c10;border-radius:5px;padding:9px 12px;margin-bottom:4px'>"
+                            f"<span style='font-size:12px;color:#aaa'>{label_str}"
+                            f"&nbsp;<span style='color:#6b7591'>({book_str.strip()})</span></span>"
+                            f"<span style='font-size:12px;color:{e_color}'>"
+                            f"{e_sign}{e_val*100:.1f}pp &nbsp; {verdict}</span></div>"
+                        )
+
+                if edge_html:
+                    st.markdown(
+                        f"<div style='background:#111318;border-radius:10px;padding:0'>"
+                        f"<div style='font-size:9px;color:#4a5168;text-transform:uppercase;"
+                        f"letter-spacing:1px;margin-bottom:6px'>Edge vs. Book</div>"
+                        f"{edge_html}</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                # Key rolling stats
+                stat_map = {
+                    "K%":    ("K%",    lambda v: f"{v*100:.1f}%"),
+                    "BB%":   ("BB%",   lambda v: f"{v*100:.1f}%"),
+                    "K-BB%": ("K-BB%", lambda v: f"{v*100:.1f}%"),
+                    "xFIP":  ("xFIP",  lambda v: f"{v:.2f}"),
+                    "wOBA":  ("wOBA",  lambda v: f"{v:.3f}"),
+                    "BABIP": ("BABIP", lambda v: f"{v:.3f}"),
+                }
+                stat_html = ""
+                for raw_k, (lbl, fmt) in stat_map.items():
+                    val = s.get(f"roll_{raw_k}")
+                    if val is not None and not (isinstance(val, float) and np.isnan(val)):
+                        stat_html += (
+                            f"<div style='text-align:center;background:#0a0c10;"
+                            f"border-radius:5px;padding:8px'>"
+                            f"<div style='font-size:9px;color:#4a5168;text-transform:uppercase;"
+                            f"letter-spacing:1px'>{lbl}</div>"
+                            f"<div style='font-size:14px;color:#cdd4e8'>{fmt(float(val))}</div></div>"
+                        )
+
+                if stat_html:
+                    st.markdown(
+                        f"<div style='margin-top:10px'>"
+                        f"<div style='font-size:9px;color:#4a5168;text-transform:uppercase;"
+                        f"letter-spacing:1px;margin-bottom:6px'>10-start rolling averages</div>"
+                        f"<div style='display:grid;grid-template-columns:repeat(3,1fr);gap:6px'>"
+                        f"{stat_html}</div></div>",
+                        unsafe_allow_html=True,
+                    )
+
+                st.markdown("</div>", unsafe_allow_html=True)
+
+        render_card(col_a, "Away", m["away"])
+        with col_vs:
+            st.markdown(
+                "<div style='text-align:center;padding-top:80px;font-size:20px;color:#4a5168'>vs</div>",
+                unsafe_allow_html=True,
+            )
+        render_card(col_h, "Home", m["home"])
+
+        col_del, _ = st.columns([1, 7])
+        with col_del:
+            if st.button("Remove", key=f"del_{i}"):
+                st.session_state.matchups.pop(i)
+                st.rerun()
+
+        st.divider()
+
+
+# ══════════════════════════════════════════════
+# TAB 2 — ALL PITCHERS
+# ══════════════════════════════════════════════
+with tab_rankings:
+    st.markdown("### All Pitcher Probabilities")
+    st.caption("Full ranked list. Probabilities based on rolling 10-start averages from your uploaded data.")
+
+    rolling = get_pitcher_rolling_stats(pit_df)
+    feat_cols = get_feature_cols()
+    valid = rolling.dropna(subset=feat_cols).copy()
+
+    if valid.empty:
+        st.warning("Not enough data to rank pitchers yet.")
+    else:
+        probs = meta["model"].predict_proba(valid[feat_cols].values.astype(float))[:, 1]
+        valid["prob"] = probs
+        valid["Model Prob"] = [f"{p*100:.1f}%" for p in probs]
+        valid["Yes Odds"] = [prob_to_american(p) for p in probs]
+        valid["No Odds"]  = [prob_to_american(1-p) for p in probs]
+        valid["vs Avg"]   = [f"{'+'if p>=meta['baseline'] else ''}{(p-meta['baseline'])*100:.1f}pp" for p in probs]
+
+        # Filters
+        fc1, fc2, fc3 = st.columns([2, 2, 2])
+        with fc1:
+            search = st.text_input("Search pitcher", placeholder="Name...", label_visibility="visible")
+        with fc2:
+            teams = ["All"] + sorted(valid["Tm"].dropna().unique().tolist())
+            team_filter = st.selectbox("Team", teams)
+        with fc3:
+            min_starts = st.slider("Min starts in data", 1, 30, 5)
+
+        # Apply filters
+        start_counts = pit_df.groupby("Name").size().reset_index(name="starts")
+        valid = valid.merge(start_counts, on="Name", how="left")
+        mask = valid["starts"] >= min_starts
+        if search:
+            mask &= valid["Name"].str.lower().str.contains(search.lower())
+        if team_filter != "All":
+            mask &= valid["Tm"] == team_filter
+        filtered = valid[mask].sort_values("prob", ascending=False).reset_index(drop=True)
+        filtered.index += 1
+
+        st.caption(f"{len(filtered)} pitchers shown")
+        st.dataframe(
+            filtered[["Name", "Tm", "Model Prob", "Yes Odds", "No Odds", "vs Avg", "starts"]].rename(
+                columns={"Tm": "Team", "starts": "Starts"}
+            ),
+            use_container_width=True,
+            height=500,
+        )
+
+
+# ══════════════════════════════════════════════
+# TAB 3 — HOW TO USE
+# ══════════════════════════════════════════════
+with tab_guide:
+    st.markdown("""
+### Daily Workflow
+
+**Step 1 — Download from FanGraphs** (takes ~2 minutes)
+
+1. Go to **fangraphs.com**
+2. Click **Pitchers** at the top → **Splits**
+3. Set Split Type: **Innings Pitched** → **First Inning**
+4. Set the season to the current year, group by **Player**
+5. Click the **Export Data** button (bottom of page)
+6. Save the CSV somewhere easy to find
+
+**Step 2 — Upload and train**
+
+1. Come back to this app
+2. Click **Browse files** in the left sidebar
+3. Upload the CSV you just downloaded
+4. The model trains automatically in a few seconds
+
+**Step 3 — Build matchups**
+
+1. Go to the **Matchups** tab
+2. Click **Add a Matchup**
+3. Select the away and home starting pitcher
+4. Optionally type in the sportsbook's American odds (e.g. `+130`, `-150`)
+5. Click **Add Matchup**
+
+---
+
+### Understanding the Output
+
+| Term | What it means |
+|---|---|
+| **Model Prob** | The model's estimated % chance the pitcher allows ≥1 run in the 1st inning |
+| **Model Odds** | That probability expressed as American odds |
+| **vs League Avg** | How much higher or lower this pitcher is vs the ~29.5% league baseline |
+| **Edge** | Your advantage vs the book. Positive = model sees value on that side |
+| **Rolling stats** | The 10-start rolling averages the model used to make this prediction |
+
+---
+
+### What makes a good bet signal?
+
+The model is most confident when:
+- Edge is **+4pp or more** on one side
+- The pitcher has **10+ starts** of data (rolling averages are more stable)
+- Model probability is **meaningfully different** from 29.5% baseline — not just noise
+
+Don't use single-game results to judge the model. Evaluate over 50+ bets.
+
+---
+
+### Required CSV columns
+
+Your FanGraphs export must contain these columns:
+`Date, Name, Tm, R, K%, BB%, K-BB%, wOBA, xFIP, BABIP, GB%, LD%, FB%, WHIP`
+
+If you get a "missing columns" error, make sure you're on the **Pitchers → Splits → First Inning** view, not the standard leaderboard.
+    """)
